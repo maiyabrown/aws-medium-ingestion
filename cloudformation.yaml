@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Medium RSS Ingestion Lambda Function with EventBridge Scheduler'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store Medium articles
+    Default: medium-usecase-bucket
+  
+  ScheduleExpression:
+    Type: String
+    Description: EventBridge schedule expression (e.g., rate(6 hours))
+    Default: rate(6 hours)
+  
+  MaxFeeds:
+    Type: Number
+    Description: Maximum number of feeds to process per execution
+    Default: 30
+    MinValue: 1
+    MaxValue: 100
+
+Resources:
+  # S3 Bucket for storing articles
+  MediumDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt MediumDataBucket.Arn
+                  - !Sub '${MediumDataBucket.Arn}/*'
+
+  # Lambda Function
+  MediumIngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MediumRSSIngestion
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900  # 15 minutes (max for Lambda)
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+          S3_PREFIX: medium-rss-data/
+          S3_MAIN_FILE: medium_articles_master.json
+          MAX_FEEDS: !Ref MaxFeeds
+          MIN_DELAY: '2'
+          MAX_DELAY: '5'
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual deployment package
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Please upload deployment package'}
+
+  # EventBridge Rule for scheduling
+  IngestionScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: MediumRSSIngestionSchedule
+      Description: Triggers Medium RSS ingestion every 6 hours
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MediumIngestionFunction.Arn
+          Id: MediumIngestionTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MediumIngestionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IngestionScheduleRule.Arn
+
+  # CloudWatch Log Group
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MediumIngestionFunction}'
+      RetentionInDays: 7
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt MediumIngestionFunction.Arn
+  
+  S3BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref MediumDataBucket
+  
+  ScheduleRuleName:
+    Description: Name of the EventBridge rule
+    Value: !Ref IngestionScheduleRule
+  
+  LogGroupName:
+    Description: CloudWatch Log Group name
+    Value: !Ref LambdaLogGroup
