@@ -1,40 +1,70 @@
-# Automated Ingestion of Medium Articles
-This project established a scheduled job for ingesting Medium.com articles in AWS. The articles are ingested using their free and publicly available Medium RSS Feed.
+# Medium RAG Chatbot
 
-AWS Services leveraged for this project include:
-- [ ] Amazon Sagemaker AI: Code development
-- [ ] AWS Cloudformation: Job Deployment
-- [ ] AWS Lambda: Invoking the code
-- [ ] Amazon Cloudwatch: Job monitoring
-- [ ] Amazon S3: Data Storage
+A serverless chatbot embedded in an AI/ML portfolio website that answers questions about Medium articles using Retrieval Augmented Generation (RAG). The system ingests articles automatically from Medium RSS feeds, builds a searchable vector knowledge base in S3, and exposes a chat interface powered by Amazon Bedrock.
 
-This script updates a single JSON file in S3 instead of creating new files each time. This guide also covers deploying the Medium RSS ingestion pipeline as an AWS Lambda function that runs automatically every 6 hours.
+---
 
-## Table of Contents
-1. [How It Works](#how-it-works)
-2. [Quick Start (CloudFormation)](#quick-start-cloudformation)
-3. [Testing](#testing)
-4. [Monitoring](#monitoring)
-5. [Troubleshooting](#troubleshooting)
+## Architecture Overview
 
+The system is split into three decoupled pipelines: ingestion, indexing, and chat.
 
-## How It Works
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  INGESTION  (runs every 6 hours via EventBridge)                    │
+│                                                                     │
+│  Medium RSS Feeds (110 feeds)                                       │
+│    └─→ Ingestion Lambda                                             │
+│           └─→ Deduplicates articles by ID                           │
+│           └─→ Appends new / updates existing                        │
+│           └─→ S3: medium-rss-data/medium_articles_master.json       │
+└─────────────────────────────────────────────────────────────────────┘
+                              │ S3 ObjectCreated event
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  INDEXING  (triggered automatically on each ingestion)              │
+│                                                                     │
+│  Indexer Lambda (2GB RAM, 15-min timeout)                           │
+│    └─→ Reads articles from S3                                       │
+│    └─→ MD5 hash per article → skips unchanged articles              │
+│    └─→ Sends new/changed article text to Bedrock Titan Embeddings   │
+│    └─→ Stores updated vector index                                  │
+│           └─→ S3: embeddings/article_embeddings.pkl                 │
+└─────────────────────────────────────────────────────────────────────┘
+                              │ user submits query
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  CHAT  (on demand)                                                  │
+│                                                                     │
+│  Portfolio Website (React/Vite, hosted on Vercel)                   │
+│    └─→ POST /chat  →  API Gateway HTTP API                          │
+│           └─→ Chat Lambda (1GB RAM, 60-sec timeout)                 │
+│                  └─→ Embeds query via Bedrock Titan                 │
+│                  └─→ Cosine similarity search over cached vectors   │
+│                  └─→ Retrieves top-5 matching articles              │
+│                  └─→ Constructs prompt + context                    │
+│                  └─→ Calls Claude 3 Haiku via Bedrock               │
+│                  └─→ Saves interaction to DynamoDB (30-day TTL)     │
+│                  └─→ Returns response + source citations            │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-### Single Master File Approach
-- **File**: `medium_articles_master.json` in your S3 bucket
-- **Updates**: Appends new articles, updates existing ones
-- **Backups**: Creates timestamped backups before each update
+---
 
+## Knowledge Base (S3)
 
-### Data Structure
+The knowledge base lives entirely in S3 and is organized into two layers.
+
+### Article Store
+
+**Path:** `medium-rss-data/medium_articles_master.json`
+
+A single, incrementally updated JSON file. Each ingestion run appends new articles and updates the `last_seen` timestamp on existing ones — no duplicates, no new files per run.
 
 ```json
 {
   "metadata": {
-    "created_at": "2026-01-27T10:00:00",
-    "last_updated": "2026-01-27T15:30:00",
-    "total_ingestions": 5,
-    "total_articles": 1250
+    "last_updated": "2026-04-26T15:30:00",
+    "total_articles": 3000
   },
   "articles": [
     {
@@ -42,340 +72,161 @@ This script updates a single JSON file in S3 instead of creating new files each 
       "title": "Article Title",
       "link": "https://medium.com/...",
       "author": "Author Name",
-      "published": "2026-01-27T09:00:00",
+      "published": "2026-01-15T09:00:00",
       "summary": "Article summary...",
-      "tags": ["python", "ai"],
+      "tags": ["python", "machine-learning"],
       "source_feed": "https://medium.com/feed/tag/python",
-      "first_seen": "2026-01-27T10:00:00",
-      "last_seen": "2026-01-27T15:30:00"
-    }
-  ],
-  "ingestion_history": [
-    {
-      "timestamp": "2026-01-27T15:30:00",
-      "feed_count": 50,
-      "new_articles": 25,
-      "updated_articles": 10,
-      "total_after": 1250
+      "first_seen": "2026-01-15T10:00:00",
+      "last_seen": "2026-04-26T15:30:00"
     }
   ]
 }
 ```
 
-## Key Features
+The ingestion Lambda pulls from 110 Medium RSS feeds across 84 topics (AI, Python, JavaScript, cloud, databases, etc.) and 26 publications (Towards Data Science, Better Programming, etc.). Running every 6 hours, the knowledge base grows to roughly 3,000–5,000 articles over the first month.
 
-### 1. **Deduplication**
-- Uses article IDs to prevent duplicates
-- New articles are added
-- Existing articles get `last_seen` timestamp updated
+### Vector Index
 
-### 2. **Automatic Backups**
-- Creates timestamped backup before each update
-- Format: `medium_articles_master_backup_YYYYMMDD_HHMMSS.json`
-- Keeps your data safe
+**Path:** `embeddings/article_embeddings.pkl`
 
-### 3. **Tracking**
-- `first_seen`: When article was first ingested
-- `last_seen`: Last time article appeared in feeds
-- Ingestion history with statistics
-
-### 4. **Growth Over Time**
-Running daily for a month:
-- Day 1: ~500 articles
-- Day 7: ~1,500 articles (new + recurring)
-- Day 30: ~3,000-5,000 articles
-
-
-## Usage
-
-### Basic Usage
-```bash
-python medium_incremental_ingestion.py
-```
-
-
-### Configuration
-Edit the script to customize:
-
-```python
-# Choose your bucket
-S3_BUCKET_NAME = "your-medium-data-bucket"
-
-# Choose your feeds
-SELECTED_FEEDS = TECH_FOCUSED  # or ALL_FEEDS, BUSINESS_FOCUSED, etc.
-
-# Master file name (single file that gets updated)
-S3_MAIN_FILE = "medium_articles_master.json"
-```
-
-
-## Example Output
+Each article is embedded as a 1536-dimension vector using Amazon Titan Embeddings (V1). The indexer converts each article into a searchable text string:
 
 ```
-====================================================
-Medium RSS Incremental Ingestion Pipeline
-====================================================
-
-[1/6] Setting up S3 bucket...
-✓ Bucket my-medium-bucket already exists
-
-[2/6] Creating backup of existing data...
-✓ Created backup: s3://my-medium-bucket/medium-rss-data/medium_articles_master_backup_20260127_153045.json
-
-[3/6] Downloading existing data from S3...
-✓ Downloaded existing data: 1000 articles
-
-[4/6] Ingesting articles from 50 feeds...
-Progress: 10/50 feeds (95 unique articles so far)
-Progress: 20/50 feeds (187 unique articles so far)
-...
-✓ Ingestion complete!
-  Total unique articles: 485
-
-[5/6] Merging new articles with existing data...
-
-📊 Merge Results:
-  New articles added: 125
-  Existing articles updated: 360
-  Total articles in dataset: 1125
-
-[6/6] Uploading updated data to S3...
-✓ Updated s3://my-medium-bucket/medium-rss-data/medium_articles_master.json
-
-📈 Dataset Statistics:
-  Total articles: 1125
-  Total ingestions: 6
-  Created: 2026-01-20T10:00:00
-  Last updated: 2026-01-27T15:30:45
-  Unique authors: 487
-
-  Top 10 tags:
-    - python: 234
-    - artificial-intelligence: 198
-    - machine-learning: 187
-    - data-science: 165
-    - javascript: 142
-    ...
-
-====================================================
-✓ Pipeline completed successfully!
-====================================================
-Location: s3://my-medium-bucket/medium-rss-data/medium_articles_master.json
-====================================================
+Title: {title}  Author: {author}  Summary: {summary}  Tags: {tags}
 ```
 
-## Quick Start (CloudFormation)
+The vector index is stored as a serialized dictionary containing:
+- `embeddings` — list of float vectors, one per article
+- `article_ids` — parallel list of article IDs
+- `article_hashes` — MD5 hash per article for change detection
 
-### Option 1: Deploy via AWS Console
+The indexer only calls Bedrock for articles that are new or whose content has changed, keeping embedding costs near zero on subsequent runs.
 
-1. **Upload CloudFormation Template**
-   ```
-   - Go to AWS CloudFormation Console
-   - Click "Create stack" → "With new resources"
-   - Upload cloudformation-template.yaml
-   ```
+---
 
-2. **Configure Parameters**
-   ```
-   S3BucketName: my-medium-data-bucket (must be globally unique)
-   ScheduleExpression: rate(6 hours)
-   MaxFeeds: 30
-   ```
+## Website Integration
 
-3. **Create Stack**
-   - Review and create
-   - Wait for stack creation to complete (~2-3 minutes)
+The chatbot is embedded directly inside the portfolio as a React route — no iframe, no separate deployment.
 
-4. **Upload Lambda Code**
-   ```bash
-   # Build deployment package
-   ./build_lambda.sh
-   
-   # Update Lambda function
-   aws lambda update-function-code \
-     --function-name MediumRSSIngestion \
-     --zip-file fileb://lambda_deployment.zip
-   ```
+**Route:** `/projects/chat` in the Vite/React portfolio
 
-### Option 2: Deploy via AWS CLI (my preference)
+**Component:** `src/pages/ChatBot.jsx`
+
+The component communicates with the API Gateway over HTTPS. On page load it fetches the session's previous messages. Each user query is sent as:
+
+```json
+{
+  "action": "chat",
+  "sessionId": "session-<timestamp>",
+  "query": "What are the latest AI trends?",
+  "includeHistory": true
+}
+```
+
+The Lambda returns a Markdown-formatted response alongside source citations (title, author, publication date, link, and cosine similarity score). The frontend renders these using `react-markdown` with syntax highlighting via `react-syntax-highlighter`.
+
+Session IDs are generated client-side (`session-<Date.now()>`) and scoped to the browser tab, so each visitor gets an independent conversation. Chat history is loaded from DynamoDB on mount to restore context within a session.
+
+---
+
+## Infrastructure
+
+Deployed via a single CloudFormation template (`rag-cloudformation.yaml`).
+
+| Resource | Purpose |
+|----------|---------|
+| S3 (data bucket) | Stores articles JSON and embeddings |
+| Lambda — Chat Handler | Processes queries, calls Bedrock, returns responses |
+| Lambda — Indexer | Generates and updates the vector index |
+| API Gateway HTTP API | `POST /chat` endpoint consumed by the portfolio frontend |
+| DynamoDB — ChatHistory | Persists conversations (partition: `sessionId`, sort: `timestamp`) |
+| IAM Roles | Least-privilege roles scoped to only the required S3 keys, DynamoDB table, and Bedrock models |
+
+The CloudFormation stack wires the S3 bucket notification directly to the Indexer Lambda so the index stays in sync automatically whenever ingestion runs — no polling, no cron needed on the indexing side.
+
+---
+
+## Cost Optimization
+
+The entire stack is optimized to run under **$3–5/month** for portfolio-scale traffic.
+
+**Claude 3 Haiku instead of Sonnet/Opus**
+Haiku is the most cost-efficient Claude model on Bedrock. At ~100 queries/month, the LLM cost is under $0.50.
+
+**Lambda container reuse (in-memory caching)**
+The embeddings and articles JSON are loaded from S3 once per Lambda container lifecycle and cached in module-level globals. Subsequent invocations on the same warm container skip the S3 reads entirely, cutting both latency and cost on back-to-back queries.
+
+**Incremental indexing**
+The indexer hashes each article's text before calling Bedrock. On a typical run where 90%+ of articles are unchanged, only new and updated articles generate Bedrock API calls. This keeps embedding costs near zero after the initial index build.
+
+**In-memory cosine similarity instead of a managed vector database**
+OpenSearch Serverless has a $24/month floor. For a knowledge base under 100k articles, cosine similarity over NumPy arrays in Lambda memory is fast enough and costs nothing beyond the Lambda invocation itself.
+
+**DynamoDB on-demand with TTL**
+No provisioned capacity means zero cost when idle. The 30-day TTL on chat history automatically purges old sessions, keeping storage costs flat.
+
+**API Gateway HTTP API**
+The HTTP API (v2) is ~70% cheaper per request than the REST API (v1) with equivalent functionality for this use case.
+
+**CloudFront PriceClass_100**
+Restricts edge distribution to North America and Europe — the lowest-cost tier — which covers the expected audience without paying for global edge locations.
+
+### Estimated Monthly Cost
+
+| Service | Cost |
+|---------|------|
+| S3 storage (~5GB) | $0.12 |
+| CloudFront (10GB transfer) | $0.85 |
+| API Gateway (1,000 requests) | $0.00 |
+| Lambda (1,000 invocations, 30s avg, 1GB) | $0.20 |
+| Bedrock — Claude 3 Haiku (100 queries) | $0.50 |
+| Bedrock — Titan Embeddings (indexing) | $0.01 |
+| DynamoDB on-demand | $0.25 |
+| **Total** | **~$2–3/month** |
+
+---
+
+## Deployment
+
+**Prerequisites:** AWS CLI configured, Bedrock model access enabled for `anthropic.claude-3-haiku-20240307-v1:0` and `amazon.titan-embed-text-v1`.
 
 ```bash
-# 1. Create stack
+# 1. Deploy infrastructure
 aws cloudformation create-stack \
-  --stack-name medium-rss-ingestion \
-  --template-body file://cloudformation-template.yaml \
+  --stack-name medium-rag-chatbot \
+  --template-body file://rag-cloudformation.yaml \
   --parameters \
-    ParameterKey=S3BucketName,ParameterValue=my-medium-data-bucket \
-    ParameterKey=ScheduleExpression,ParameterValue="rate(6 hours)" \
-    ParameterKey=MaxFeeds,ParameterValue=30 \
+    ParameterKey=S3BucketName,ParameterValue=your-bucket-name \
   --capabilities CAPABILITY_IAM
 
-# 2. Wait for stack creation
-aws cloudformation wait stack-create-complete \
-  --stack-name medium-rss-ingestion
+aws cloudformation wait stack-create-complete --stack-name medium-rag-chatbot
 
-# 3. Build and upload Lambda code
-./build_lambda.sh
-
+# 2. Build and upload the chat Lambda
+python build_lambda.py
 aws lambda update-function-code \
-  --function-name MediumRSSIngestion \
+  --function-name MediumRAG-ChatHandler \
   --zip-file fileb://lambda_deployment.zip
+
+# 3. Upload the indexer Lambda
+aws lambda update-function-code \
+  --function-name MediumRAG-Indexer \
+  --zip-file fileb://indexer.zip
+
+# 4. Set the API endpoint in the portfolio
+# Add VITE_API_ENDPOINT=<ApiEndpoint from stack outputs> to .env.production
 ```
 
-
-## Testing
-
-### Test Lambda Manually
-
-**Via AWS Console:**
-1. Go to Lambda → Functions → MediumRSSIngestion
-2. Click "Test" tab
-3. Create test event (use default empty JSON: `{}`)
-4. Click "Test"
-5. Check execution results
-
-**Via AWS CLI:**
+**Get the API endpoint:**
 ```bash
-aws lambda invoke \
-  --function-name MediumRSSIngestion \
-  --payload '{}' \
-  response.json
-
-# View results
-cat response.json | jq
-```
-
-### Check S3 Output
-
-```bash
-# List files in bucket
-aws s3 ls s3://my-medium-data-bucket/medium-rss-data/
-
-# Download and view the data
-aws s3 cp s3://my-medium-data-bucket/medium-rss-data/medium_articles_master.json ./
-
-# Check article count
-cat medium_articles_master.json | jq '.articles | length'
-```
-
-### View Logs
-
-**Via Console:**
-- Go to CloudWatch → Log groups
-- Find `/aws/lambda/MediumRSSIngestion`
-- View latest log stream
-
-**Via CLI:**
-```bash
-# Get recent logs
-aws logs tail /aws/lambda/MediumRSSIngestion --follow
+aws cloudformation describe-stacks \
+  --stack-name medium-rag-chatbot \
+  --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" \
+  --output text
 ```
 
 ---
 
-## Monitoring
+## Related Repositories
 
-### CloudWatch Metrics
-
-View Lambda metrics:
-- Invocations
-- Duration
-- Errors
-- Throttles
-
-```bash
-# Get recent invocations
-aws cloudwatch get-metric-statistics \
-  --namespace AWS/Lambda \
-  --metric-name Invocations \
-  --dimensions Name=FunctionName,Value=MediumRSSIngestion \
-  --start-time 2024-01-01T00:00:00Z \
-  --end-time 2024-01-02T00:00:00Z \
-  --period 3600 \
-  --statistics Sum
-```
-
-### Set Up Alarms
-
-Get notified if Lambda fails:
-
-```bash
-# Create SNS topic for alerts
-aws sns create-topic --name MediumRSSAlerts
-
-# Subscribe your email
-aws sns subscribe \
-  --topic-arn arn:aws:sns:us-east-1:YOUR_ACCOUNT_ID:MediumRSSAlerts \
-  --protocol email \
-  --notification-endpoint your-email@example.com
-
-# Create CloudWatch alarm
-aws cloudwatch put-metric-alarm \
-  --alarm-name MediumRSSLambdaErrors \
-  --alarm-description "Alert on Lambda errors" \
-  --metric-name Errors \
-  --namespace AWS/Lambda \
-  --statistic Sum \
-  --period 3600 \
-  --threshold 1 \
-  --comparison-operator GreaterThanThreshold \
-  --evaluation-periods 1 \
-  --dimensions Name=FunctionName,Value=MediumRSSIngestion \
-  --alarm-actions arn:aws:sns:us-east-1:YOUR_ACCOUNT_ID:MediumRSSAlerts
-```
-
----
-
-
-## Troubleshooting
-
-### Lambda Times Out (15 minutes)
-
-**Problem:** Too many feeds for 15-minute limit
-
-**Solution:** Reduce MAX_FEEDS
-```bash
-# Update to process fewer feeds
-aws lambda update-function-configuration \
-  --function-name MediumRSSIngestion \
-  --environment Variables="{...,MAX_FEEDS=20,...}"
-```
-
-### Rate Limiting Errors
-
-**Problem:** All feeds failing with 403/429
-
-**Solution:** Run less frequently
-```bash
-# Change to every 12 hours
-aws events put-rule \
-  --name MediumRSSIngestionSchedule \
-  --schedule-expression "rate(12 hours)"
-```
-
-### No Data in S3
-
-**Checklist:**
-1. Check Lambda execution logs
-2. Verify S3 bucket name in environment variables
-3. Check IAM permissions
-4. Test Lambda manually
-
-```bash
-# View recent errors
-aws logs filter-log-events \
-  --log-group-name /aws/lambda/MediumRSSIngestion \
-  --filter-pattern "ERROR"
-```
-
-### Permission Denied
-
-**Problem:** Lambda can't write to S3
-
-**Solution:** Check IAM role
-```bash
-# Verify role has S3 permissions
-aws iam get-role-policy \
-  --role-name MediumRSSLambdaRole \
-  --policy-name S3Access
-```
+- **aws-medium-ingestion** — EventBridge-scheduled Lambda that populates the article knowledge base in S3
+- **ai-ml-portfolio** — The React/Vite portfolio website that embeds this chatbot at `/projects/chat`
